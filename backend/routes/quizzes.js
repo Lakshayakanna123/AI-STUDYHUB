@@ -3,6 +3,8 @@ const axios = require('axios');
 const { Quiz, GeneratedQuestion } = require('../models/Quiz');
 const QuizAttempt = require('../models/QuizAttempt');
 const VideoProgress = require('../models/VideoProgress');
+const Video = require('../models/Video');
+const Transcript = require('../models/Transcript');
 const { StudentProgress } = require('../models/Misc');
 const { protect, authorize } = require('../middleware/auth');
 
@@ -54,7 +56,67 @@ router.post('/generated/:videoId/publish', protect, authorize('teacher'), async 
   }
 });
 
-// @route  GET /api/quizzes/video/:videoId  (fetch quiz — unlocked for student at 90% watch, always unlocked for teacher)
+// Helper: Auto-generate quiz via AI service from transcript or video title
+async function autoGenerateQuiz(videoId) {
+  try {
+    const video = await Video.findById(videoId);
+    if (!video) return null;
+
+    // Look up existing transcript
+    const transcript = await Transcript.findOne({ video: videoId });
+    const transcriptText = transcript ? transcript.rawText : '';
+
+    console.log(`[Quiz Auto-Gen] Calling AI service for video "${video.title}" (${videoId})`);
+
+    const { data } = await axios.post(`${process.env.AI_SERVICE_URL}/transcribe/generate-quiz`, {
+      transcript: transcriptText,
+      title: video.title || 'Lecture',
+      videoId: videoId.toString(),
+      courseId: video.course.toString(),
+    });
+
+    if (data.status === 'generated') {
+      // Reload the quiz that the AI service just saved to DB
+      const quiz = await Quiz.findOne({ video: videoId, published: true });
+      return quiz;
+    }
+    return null;
+  } catch (err) {
+    console.error(`[Quiz Auto-Gen] Failed for video ${videoId}:`, err.message);
+    return null;
+  }
+}
+
+// @route  POST /api/quizzes/generate/:videoId  (explicitly trigger quiz generation)
+router.post('/generate/:videoId', protect, async (req, res) => {
+  try {
+    // Check if quiz already exists
+    let quiz = await Quiz.findOne({ video: req.params.videoId, published: true });
+    if (quiz) {
+      const safeQuiz = quiz.toObject();
+      if (req.user.role === 'student') {
+        safeQuiz.questions = safeQuiz.questions.map(({ correctAnswer, modelAnswer, ...q }) => q);
+      }
+      return res.json({ status: 'existing', quiz: safeQuiz });
+    }
+
+    // Auto-generate
+    quiz = await autoGenerateQuiz(req.params.videoId);
+    if (!quiz) {
+      return res.status(500).json({ message: 'Quiz generation failed. Please try again.' });
+    }
+
+    const safeQuiz = quiz.toObject();
+    if (req.user.role === 'student') {
+      safeQuiz.questions = safeQuiz.questions.map(({ correctAnswer, modelAnswer, ...q }) => q);
+    }
+    res.status(201).json({ status: 'generated', quiz: safeQuiz });
+  } catch (err) {
+    res.status(500).json({ message: 'Quiz generation failed', error: err.message });
+  }
+});
+
+// @route  GET /api/quizzes/video/:videoId  (fetch quiz — auto-generates if missing)
 router.get('/video/:videoId', protect, async (req, res) => {
   try {
     if (req.user.role === 'student') {
@@ -64,8 +126,15 @@ router.get('/video/:videoId', protect, async (req, res) => {
       }
     }
 
-    const quiz = await Quiz.findOne({ video: req.params.videoId, published: true });
-    if (!quiz) return res.status(404).json({ message: 'Quiz not available' });
+    let quiz = await Quiz.findOne({ video: req.params.videoId, published: true });
+
+    // Auto-generate if quiz doesn't exist yet
+    if (!quiz) {
+      console.log(`[Quiz] No published quiz found for video ${req.params.videoId}, triggering auto-generation...`);
+      quiz = await autoGenerateQuiz(req.params.videoId);
+    }
+
+    if (!quiz) return res.status(404).json({ message: 'Quiz not available', canGenerate: true });
 
     const safeQuiz = quiz.toObject();
     if (req.user.role === 'student') {
@@ -97,7 +166,7 @@ router.post('/:quizId/submit', protect, async (req, res) => {
       answers: data.results,
       totalScore: data.totalScore,
       totalMarks: data.totalMarks,
-      percentage: quiz.totalMarks ? Math.round((data.totalScore / quiz.totalMarks) * 100) : 0,
+      percentage: data.totalMarks ? Math.round((data.totalScore / data.totalMarks) * 100) : 0,
       aiFeedbackSummary: data.feedbackSummary,
     });
 
@@ -134,3 +203,4 @@ router.get('/attempts/:courseId', protect, authorize('teacher'), async (req, res
 });
 
 module.exports = router;
+

@@ -1,7 +1,9 @@
 const express = require('express');
+const axios = require('axios');
 const VideoProgress = require('../models/VideoProgress');
 const { StudentProgress, Analytics } = require('../models/Misc');
 const Video = require('../models/Video');
+const { Quiz } = require('../models/Quiz');
 const { protect } = require('../middleware/auth');
 
 const router = express.Router();
@@ -50,6 +52,22 @@ router.post('/video', protect, async (req, res) => {
     }
 
     await progress.save();
+
+    // Proactively trigger quiz generation when quiz gets unlocked
+    if (progress.quizUnlocked) {
+      const existingQuiz = await Quiz.findOne({ video: videoId, published: true });
+      if (!existingQuiz) {
+        // Fire-and-forget: trigger AI quiz generation in background
+        axios
+          .post(`${process.env.AI_SERVICE_URL}/transcribe/generate-quiz`, {
+            videoId: videoId.toString(),
+            courseId: (effectiveCourseId || '').toString(),
+            title: video.title || 'Lecture',
+          })
+          .then(() => console.log(`[Progress] Auto-triggered quiz generation for video ${videoId}`))
+          .catch((err) => console.error(`[Progress] Quiz auto-gen trigger failed:`, err.message));
+      }
+    }
 
     // Recalculate rolled up StudentProgress
     if (courseId) {

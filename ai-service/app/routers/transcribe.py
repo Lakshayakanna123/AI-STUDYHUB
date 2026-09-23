@@ -192,3 +192,91 @@ def _process_video_task(video_id: str, video_url: str, course_id: str):
             {"$set": {"transcriptStatus": "failed"}}
         )
         print(f"process_video failed for {video_id}: {e}")
+
+
+class GenerateQuizRequest(BaseModel):
+    transcript: str = ""
+    title: str = ""
+    videoId: str = ""
+    courseId: str = ""
+
+
+@router.post("/generate-quiz")
+async def generate_quiz_from_transcript(req: GenerateQuizRequest):
+    """On-demand quiz generation from transcript text or video title/topic.
+    Called by the backend when a student requests a quiz and none exists yet."""
+    transcript_text = req.transcript
+
+    # If no transcript provided but videoId given, look it up from DB
+    if not transcript_text and req.videoId:
+        v_obj_id = ObjectId(req.videoId) if ObjectId.is_valid(req.videoId) else req.videoId
+        transcript_doc = db.transcripts.find_one({"video": v_obj_id})
+        if transcript_doc:
+            transcript_text = transcript_doc.get("rawText", "")
+
+    # If still no transcript, generate from title/topic
+    if not transcript_text:
+        transcript_text = (
+            f"This lecture is titled '{req.title or 'General Topic'}'. "
+            f"It covers core concepts, fundamentals, step-by-step examples, "
+            f"definitions, practical exercises, and key takeaways for student practice."
+        )
+
+    gen = generate_questions(transcript_text)
+    questions = gen.get("questions", [])
+
+    # If videoId and courseId provided, auto-save and publish the quiz in DB
+    if req.videoId and req.courseId:
+        v_obj_id = ObjectId(req.videoId) if ObjectId.is_valid(req.videoId) else req.videoId
+        c_obj_id = ObjectId(req.courseId) if ObjectId.is_valid(req.courseId) else req.courseId
+
+        # Ensure each question has an _id for Mongoose compatibility
+        from bson import ObjectId as BsonObjId
+        for q in questions:
+            if "_id" not in q:
+                q["_id"] = BsonObjId()
+
+        db.quizzes.update_one(
+            {"video": v_obj_id},
+            {
+                "$set": {
+                    "video": v_obj_id,
+                    "course": c_obj_id,
+                    "title": f"{req.title or 'Lecture'} Quiz",
+                    "questions": questions,
+                    "published": True,
+                    "totalMarks": sum(q.get("marks", 1) for q in questions),
+                }
+            },
+            upsert=True,
+        )
+
+        # Also save/update generated questions draft
+        db.generatedquestions.update_one(
+            {"video": v_obj_id},
+            {"$set": {"video": v_obj_id, "questions": questions, "reviewed": False}},
+            upsert=True,
+        )
+
+        # If we generated a transcript fallback, save it too
+        if not db.transcripts.find_one({"video": v_obj_id}):
+            db.transcripts.insert_one({
+                "video": v_obj_id,
+                "course": c_obj_id,
+                "rawText": transcript_text,
+                "summary": gen.get("summary", ""),
+                "keyConcepts": gen.get("key_concepts", []),
+            })
+
+        # Mark video as processed
+        db.videos.update_one(
+            {"_id": v_obj_id},
+            {"$set": {"transcriptStatus": "done", "questionsGenerated": True}},
+        )
+
+    return {
+        "status": "generated",
+        "questions": questions,
+        "summary": gen.get("summary", ""),
+        "key_concepts": gen.get("key_concepts", []),
+    }

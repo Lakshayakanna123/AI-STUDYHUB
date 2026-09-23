@@ -124,7 +124,14 @@ const CourseDetail = () => {
                       activeVideo?._id === v._id ? 'bg-brand-50 text-brand-700' : 'hover:bg-gray-50 text-gray-600'
                     }`}
                   >
-                    {v.title}
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="truncate">{v.title}</span>
+                      {v.questionsGenerated ? (
+                        <span className="text-xs text-emerald-600 font-medium whitespace-nowrap">Quiz ✅</span>
+                      ) : v.transcriptStatus === 'processing' ? (
+                        <span className="text-xs text-amber-500 font-medium whitespace-nowrap">AI ⏳</span>
+                      ) : null}
+                    </div>
                     {v.transcriptStatus !== 'done' && (
                       <span className="text-xs text-gray-400 block">AI processing: {v.transcriptStatus}</span>
                     )}
