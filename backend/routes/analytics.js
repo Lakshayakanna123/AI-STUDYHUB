@@ -13,14 +13,26 @@ const router = express.Router();
 router.get('/teacher', protect, authorize('teacher'), async (req, res) => {
   try {
     const User = require('../models/User');
-    const courses = await Course.find({ teacher: req.user._id }).populate('students', 'name email lastActive');
+
+    // 1. Fetch teacher's created courses, or fallback to all courses if none specifically assigned
+    let courses = await Course.find({ teacher: req.user._id }).populate('students', 'name email lastActive');
+    if (!courses || courses.length === 0) {
+      courses = await Course.find().populate('students', 'name email lastActive');
+    }
+
     const courseIds = courses.map((c) => c._id);
 
-    const videos = await Video.find({ course: { $in: courseIds } });
-    const quizzes = await Quiz.find({ course: { $in: courseIds } });
-    const attempts = await QuizAttempt.find({ course: { $in: courseIds } })
+    // 2. Fetch all videos, quizzes, attempts, and video progress across system
+    const videos = await Video.find({ $or: [{ course: { $in: courseIds } }, { course: { $exists: true } }] });
+    const quizzes = await Quiz.find({ $or: [{ course: { $in: courseIds } }, { course: { $exists: true } }] });
+    const attempts = await QuizAttempt.find()
       .populate('student', 'name email')
       .populate('quiz', 'title')
+      .populate('course', 'title');
+
+    const allVideoProgresses = await VideoProgress.find()
+      .populate('student', 'name email')
+      .populate('video', 'title')
       .populate('course', 'title');
 
     const allStudents = await User.find({ role: 'student' }).select('name email lastActive coursesEnrolled');
@@ -34,45 +46,49 @@ router.get('/teacher', protect, authorize('teacher'), async (req, res) => {
     let onTrackCount = 0;
     let highPerformerCount = 0;
 
-    for (const course of courses) {
-      const courseVideos = videos.filter((v) => v.course && v.course.toString() === course._id.toString());
-      const courseVideoIds = courseVideos.map((v) => v._id);
-      const courseQuizzes = quizzes.filter((q) => q.course && q.course.toString() === course._id.toString());
-      const courseQuizIds = courseQuizzes.map((q) => q._id);
+    const targetCourses = courses.length > 0
+      ? courses
+      : [{ _id: 'general', title: 'General Classroom', students: allStudents }];
 
-      // Find all student IDs that have interacted with this course
-      const vpStudentIds = await VideoProgress.find({
-        $or: [{ course: course._id }, { video: { $in: courseVideoIds } }]
-      }).distinct('student');
+    for (const course of targetCourses) {
+      const isVirtual = course._id === 'general';
+      const cIdStr = isVirtual ? 'general' : course._id.toString();
+
+      const courseVideos = videos.filter((v) => isVirtual || (v.course && v.course.toString() === cIdStr));
+      const courseVideoIds = courseVideos.map((v) => v._id.toString());
+      const courseQuizzes = quizzes.filter((q) => isVirtual || (q.course && q.course.toString() === cIdStr));
+      const courseQuizIds = courseQuizzes.map((q) => q._id.toString());
+
+      const vpStudentIds = allVideoProgresses
+        .filter((vp) => isVirtual || (vp.course && vp.course._id?.toString() === cIdStr) || (vp.video && courseVideoIds.includes(vp.video._id?.toString())))
+        .map((vp) => vp.student?._id?.toString())
+        .filter(Boolean);
 
       const qaStudentIds = attempts
-        .filter((a) => a.course && a.course._id.toString() === course._id.toString())
+        .filter((a) => isVirtual || (a.course && a.course._id?.toString() === cIdStr) || (a.quiz && courseQuizIds.includes(a.quiz._id?.toString())))
         .map((a) => a.student?._id?.toString())
         .filter(Boolean);
 
       const courseStudentObjIds = course.students ? course.students.map((s) => s._id.toString()) : [];
       const enrolledStudentObjIds = allStudents
-        .filter((s) => s.coursesEnrolled && s.coursesEnrolled.map((cId) => cId.toString()).includes(course._id.toString()))
+        .filter((s) => s.coursesEnrolled && s.coursesEnrolled.map((cId) => cId.toString()).includes(cIdStr))
         .map((s) => s._id.toString());
 
-      // If course has no enrolled students yet, fallback to all registered students for preview
+      const allRegisteredIds = allStudents.map((s) => s._id.toString());
+
       const combinedStudentIdStrs = Array.from(new Set([
         ...courseStudentObjIds,
         ...enrolledStudentObjIds,
-        ...vpStudentIds.map((id) => id.toString()),
+        ...vpStudentIds,
         ...qaStudentIds,
+        ...allRegisteredIds,
       ]));
 
-      // Fallback: if course has no students yet, include registered students
-      const finalStudentIdStrs = combinedStudentIdStrs.length > 0
-        ? combinedStudentIdStrs
-        : allStudents.map((s) => s._id.toString());
-
       const courseStudentsMap = new Map();
-      if (course.students) {
-        course.students.forEach((s) => courseStudentsMap.set(s._id.toString(), s));
+      if (course.students && Array.isArray(course.students)) {
+        course.students.forEach((s) => s && s._id && courseStudentsMap.set(s._id.toString(), s));
       }
-      for (const sid of finalStudentIdStrs) {
+      for (const sid of combinedStudentIdStrs) {
         if (!courseStudentsMap.has(sid)) {
           const userDoc = allStudents.find((u) => u._id.toString() === sid) || await User.findById(sid).select('name email lastActive');
           if (userDoc) courseStudentsMap.set(sid, userDoc);
@@ -80,41 +96,44 @@ router.get('/teacher', protect, authorize('teacher'), async (req, res) => {
       }
 
       for (const [studentIdStr, student] of courseStudentsMap.entries()) {
-        const pairKey = `${studentIdStr}_${course._id.toString()}`;
+        const pairKey = `${studentIdStr}_${cIdStr}`;
         if (processedPairs.has(pairKey)) continue;
         processedPairs.add(pairKey);
 
-        const videoProgresses = await VideoProgress.find({
-          student: student._id,
-          $or: [{ course: course._id }, { video: { $in: courseVideoIds } }]
-        }).populate('video', 'title');
+        const studentVps = allVideoProgresses.filter((vp) => {
+          if (!vp.student || vp.student._id.toString() !== studentIdStr) return false;
+          if (isVirtual) return true;
+          return (vp.course && vp.course._id?.toString() === cIdStr) ||
+                 (vp.video && courseVideoIds.includes(vp.video._id?.toString()));
+        });
 
-        const watchedCount = videoProgresses.filter((vp) => vp.isCompleted || vp.completionPercent >= 90).length;
+        const watchedCount = studentVps.filter((vp) => vp.isCompleted || vp.completionPercent >= 90).length;
         const totalCourseVideos = courseVideos.length;
 
         let avgWatch = 0;
         if (totalCourseVideos > 0) {
-          const sumWatch = videoProgresses.reduce((sum, vp) => sum + (vp.completionPercent || 0), 0);
+          const sumWatch = studentVps.reduce((sum, vp) => sum + (vp.completionPercent || 0), 0);
           avgWatch = Math.min(100, Math.round(sumWatch / totalCourseVideos));
-        } else if (videoProgresses.length > 0) {
-          const sumWatch = videoProgresses.reduce((sum, vp) => sum + (vp.completionPercent || 0), 0);
-          avgWatch = Math.min(100, Math.round(sumWatch / videoProgresses.length));
+        } else if (studentVps.length > 0) {
+          const sumWatch = studentVps.reduce((sum, vp) => sum + (vp.completionPercent || 0), 0);
+          avgWatch = Math.min(100, Math.round(sumWatch / studentVps.length));
         }
 
-        const totalWatchTime = videoProgresses.reduce((s, v) => s + (v.watchedSeconds || 0), 0);
-        const pauseCount = videoProgresses.reduce((s, v) => s + (v.pauseCount || 0), 0);
-        const replayCount = videoProgresses.reduce((s, v) => s + (v.replayCount || 0), 0);
+        const totalWatchTime = studentVps.reduce((s, v) => s + (v.watchedSeconds || 0), 0);
+        const pauseCount = studentVps.reduce((s, v) => s + (v.pauseCount || 0), 0);
+        const replayCount = studentVps.reduce((s, v) => s + (v.replayCount || 0), 0);
 
         if (avgWatch > 0) {
           grandWatchSum += avgWatch;
           watchTrackedStudentsCount++;
         }
 
-        const studentAttempts = attempts.filter(
-          (a) => a.student && a.student._id.toString() === studentIdStr &&
-                 ((a.course && a.course._id.toString() === course._id.toString()) ||
-                  (a.quiz && courseQuizIds.map(qId => qId.toString()).includes(a.quiz._id.toString())))
-        );
+        const studentAttempts = attempts.filter((a) => {
+          if (!a.student || a.student._id.toString() !== studentIdStr) return false;
+          if (isVirtual) return true;
+          return (a.course && a.course._id?.toString() === cIdStr) ||
+                 (a.quiz && courseQuizIds.includes(a.quiz._id?.toString()));
+        });
 
         const quizScore = studentAttempts.length
           ? Math.round(studentAttempts.reduce((s, a) => s + a.percentage, 0) / studentAttempts.length)
@@ -143,25 +162,27 @@ router.get('/teacher', protect, authorize('teacher'), async (req, res) => {
           onTrackCount++;
         }
 
-        await StudentProgress.findOneAndUpdate(
-          { student: student._id, course: course._id },
-          {
-            videosCompleted: watchedCount,
-            totalVideos: totalCourseVideos,
-            avgQuizScore: quizScore,
-            overallProgressPercent: overallProgress,
-            learningScore,
-            performancePrediction,
-          },
-          { upsert: true, new: true }
-        );
+        if (!isVirtual && course._id) {
+          await StudentProgress.findOneAndUpdate(
+            { student: student._id, course: course._id },
+            {
+              videosCompleted: watchedCount,
+              totalVideos: totalCourseVideos,
+              avgQuizScore: quizScore,
+              overallProgressPercent: overallProgress,
+              learningScore,
+              performancePrediction,
+            },
+            { upsert: true, new: true }
+          );
+        }
 
         studentRows.push({
           studentId: student._id,
           studentName: student.name || 'Student',
           studentEmail: student.email || '',
-          courseId: course._id,
-          course: course.title,
+          courseId: cIdStr,
+          course: course.title || 'Course',
           lastActive: student.lastActive,
           videoWatchPercent: avgWatch,
           totalWatchTimeSeconds: totalWatchTime,
@@ -183,7 +204,7 @@ router.get('/teacher', protect, authorize('teacher'), async (req, res) => {
             aiFeedbackSummary: a.aiFeedbackSummary,
             submittedAt: a.submittedAt,
           })),
-          videoBreakdown: videoProgresses.map((vp) => ({
+          videoBreakdown: studentVps.map((vp) => ({
             videoTitle: vp.video?.title || 'Video',
             completionPercent: vp.completionPercent,
             watchedSeconds: vp.watchedSeconds,
