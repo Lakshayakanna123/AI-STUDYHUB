@@ -27,7 +27,7 @@ def chat_completion(system_prompt: str, user_prompt: str, json_mode: bool = Fals
     if json_mode:
         final_system += "\n\nRespond ONLY with valid JSON. No markdown, no code fences, no commentary."
 
-    models_to_try = [GROQ_CHAT_MODEL, "llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+    models_to_try = [GROQ_CHAT_MODEL, "qwen/qwen3.8-27b", "llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
     last_err = None
 
     for model in models_to_try:

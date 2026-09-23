@@ -9,7 +9,7 @@ const { protect, authorize } = require('../middleware/auth');
 
 const router = express.Router();
 
-// @route  GET /api/analytics/teacher  (dashboard summary + per-student table)
+// @route  GET /api/analytics/teacher  (dashboard summary + per-student table + gradebook + analytics)
 router.get('/teacher', protect, authorize('teacher'), async (req, res) => {
   try {
     const courses = await Course.find({ teacher: req.user._id }).populate('students', 'name email lastActive');
@@ -17,51 +17,194 @@ router.get('/teacher', protect, authorize('teacher'), async (req, res) => {
 
     const videos = await Video.find({ course: { $in: courseIds } });
     const quizzes = await Quiz.find({ course: { $in: courseIds } });
-    const attempts = await QuizAttempt.find({ course: { $in: courseIds } }).populate('student', 'name');
+    const attempts = await QuizAttempt.find({ course: { $in: courseIds } })
+      .populate('student', 'name email')
+      .populate('quiz', 'title')
+      .populate('course', 'title');
 
     const totalStudents = new Set(courses.flatMap((c) => c.students.map((s) => s._id.toString()))).size;
-    const avgScore = attempts.length
-      ? Math.round(attempts.reduce((s, a) => s + a.percentage, 0) / attempts.length)
-      : 0;
 
-    // Per-student rows across all of this teacher's courses
     const studentRows = [];
+    let grandWatchSum = 0;
+    let watchTrackedStudentsCount = 0;
+    let atRiskCount = 0;
+    let onTrackCount = 0;
+    let highPerformerCount = 0;
+
     for (const course of courses) {
+      const courseVideos = videos.filter((v) => v.course.toString() === course._id.toString());
+      const courseQuizzes = quizzes.filter((q) => q.course.toString() === course._id.toString());
+
       for (const student of course.students) {
-        const progress = await StudentProgress.findOne({ student: student._id, course: course._id });
-        const videoProgresses = await VideoProgress.find({ student: student._id, course: course._id });
-        const avgWatch = videoProgresses.length
-          ? Math.round(videoProgresses.reduce((s, v) => s + v.completionPercent, 0) / videoProgresses.length)
-          : 0;
+        const videoProgresses = await VideoProgress.find({ student: student._id, course: course._id }).populate('video', 'title');
+
+        const watchedCount = videoProgresses.filter((vp) => vp.isCompleted).length;
+        const totalCourseVideos = courseVideos.length;
+        const avgWatch = totalCourseVideos > 0
+          ? Math.round(videoProgresses.reduce((sum, vp) => sum + (vp.completionPercent || 0), 0) / totalCourseVideos)
+          : (videoProgresses.length ? Math.round(videoProgresses.reduce((s, v) => s + v.completionPercent, 0) / videoProgresses.length) : 0);
+
         const totalWatchTime = videoProgresses.reduce((s, v) => s + v.watchedSeconds, 0);
         const pauseCount = videoProgresses.reduce((s, v) => s + v.pauseCount, 0);
         const replayCount = videoProgresses.reduce((s, v) => s + v.replayCount, 0);
 
+        if (avgWatch > 0) {
+          grandWatchSum += avgWatch;
+          watchTrackedStudentsCount++;
+        }
+
+        const studentAttempts = attempts.filter(
+          (a) => a.student && a.student._id.toString() === student._id.toString() && a.course && a.course._id.toString() === course._id.toString()
+        );
+
+        const quizScore = studentAttempts.length
+          ? Math.round(studentAttempts.reduce((s, a) => s + a.percentage, 0) / studentAttempts.length)
+          : 0;
+
+        const hasQuizData = studentAttempts.length > 0;
+        const overallProgress = hasQuizData
+          ? Math.round((avgWatch * 0.4) + (quizScore * 0.6))
+          : avgWatch;
+
+        let learningScore = 'Average';
+        if (overallProgress >= 85) learningScore = 'Excellent';
+        else if (overallProgress >= 70) learningScore = 'Good';
+        else if (overallProgress >= 50) learningScore = 'Average';
+        else learningScore = 'Needs Improvement';
+
+        let performancePrediction = 'On track';
+        if (quizScore >= 80 && avgWatch >= 70) {
+          performancePrediction = 'High Performer';
+          highPerformerCount++;
+        } else if ((hasQuizData && quizScore < 50) || avgWatch < 30) {
+          performancePrediction = 'At risk';
+          atRiskCount++;
+        } else {
+          performancePrediction = 'On track';
+          onTrackCount++;
+        }
+
+        await StudentProgress.findOneAndUpdate(
+          { student: student._id, course: course._id },
+          {
+            videosCompleted: watchedCount,
+            totalVideos: totalCourseVideos,
+            avgQuizScore: quizScore,
+            overallProgressPercent: overallProgress,
+            learningScore,
+            performancePrediction,
+          },
+          { upsert: true, new: true }
+        );
+
         studentRows.push({
+          studentId: student._id,
           studentName: student.name,
+          studentEmail: student.email,
+          courseId: course._id,
           course: course.title,
           lastActive: student.lastActive,
           videoWatchPercent: avgWatch,
           totalWatchTimeSeconds: totalWatchTime,
           pauseCount,
           replayCount,
-          videoCompletionStatus: avgWatch >= 90 ? 'Completed' : 'In Progress',
-          quizScore: progress?.avgQuizScore || 0,
-          overallProgress: progress?.overallProgressPercent || avgWatch,
-          learningScore: progress?.learningScore || 'Average',
-          performancePrediction: progress?.performancePrediction || 'On track',
+          videoCompletionStatus: avgWatch >= 90 ? 'Completed' : avgWatch > 0 ? 'In Progress' : 'Not Started',
+          quizzesAttempted: studentAttempts.length,
+          totalCourseQuizzes: courseQuizzes.length,
+          quizScore,
+          overallProgress,
+          learningScore,
+          performancePrediction,
+          quizHistory: studentAttempts.map((a) => ({
+            attemptId: a._id,
+            quizTitle: a.quiz?.title || 'Quiz',
+            totalScore: a.totalScore,
+            totalMarks: a.totalMarks,
+            percentage: a.percentage,
+            aiFeedbackSummary: a.aiFeedbackSummary,
+            submittedAt: a.submittedAt,
+          })),
+          videoBreakdown: videoProgresses.map((vp) => ({
+            videoTitle: vp.video?.title || 'Video',
+            completionPercent: vp.completionPercent,
+            watchedSeconds: vp.watchedSeconds,
+            pauseCount: vp.pauseCount,
+            replayCount: vp.replayCount,
+          })),
         });
       }
     }
 
+    const quizGradebook = attempts.map((a) => ({
+      attemptId: a._id,
+      studentId: a.student?._id,
+      studentName: a.student?.name || 'Unknown Student',
+      studentEmail: a.student?.email || '',
+      courseId: a.course?._id,
+      courseTitle: a.course?.title || 'Course',
+      quizId: a.quiz?._id,
+      quizTitle: a.quiz?.title || 'Quiz',
+      totalScore: a.totalScore,
+      totalMarks: a.totalMarks,
+      percentage: a.percentage,
+      aiFeedbackSummary: a.aiFeedbackSummary,
+      submittedAt: a.submittedAt,
+    }));
+
+    const quizSummary = quizzes.map((q) => {
+      const qAttempts = attempts.filter((a) => a.quiz && a.quiz._id.toString() === q._id.toString());
+      const avg = qAttempts.length
+        ? Math.round(qAttempts.reduce((s, a) => s + a.percentage, 0) / qAttempts.length)
+        : 0;
+      const highest = qAttempts.length ? Math.max(...qAttempts.map((a) => a.percentage)) : 0;
+      const lowest = qAttempts.length ? Math.min(...qAttempts.map((a) => a.percentage)) : 0;
+
+      return {
+        quizId: q._id,
+        quizTitle: q.title,
+        courseId: q.course,
+        totalAttempts: qAttempts.length,
+        avgScorePercent: avg,
+        highestScorePercent: highest,
+        lowestScorePercent: lowest,
+      };
+    });
+
+    const averageQuizScore = attempts.length
+      ? Math.round(attempts.reduce((s, a) => s + a.percentage, 0) / attempts.length)
+      : 0;
+
+    const averageVideoWatch = watchTrackedStudentsCount
+      ? Math.round(grandWatchSum / watchTrackedStudentsCount)
+      : 0;
+
     res.json({
+      summary: {
+        totalStudents,
+        totalCourses: courses.length,
+        totalVideos: videos.length,
+        totalQuizzes: quizzes.length,
+        totalQuizAttempts: attempts.length,
+        averageQuizScore,
+        averageVideoWatch,
+        atRiskCount,
+        onTrackCount,
+        highPerformerCount,
+      },
       totalStudents,
       totalCourses: courses.length,
       totalVideos: videos.length,
       totalQuizzes: quizzes.length,
-      averageScore: avgScore,
+      averageScore: averageQuizScore,
       students: studentRows,
-      videoCompletionStats: videos.map((v) => ({ videoId: v._id, title: v.title })), // extend with real stats as needed
+      quizGradebook,
+      quizSummary,
+      courses: courses.map((c) => ({
+        id: c._id,
+        title: c.title,
+        joinCode: c.joinCode,
+        studentCount: c.students ? c.students.length : 0,
+      })),
     });
   } catch (err) {
     res.status(500).json({ message: 'Failed to load teacher analytics', error: err.message });
@@ -91,3 +234,4 @@ router.get('/student', protect, authorize('student'), async (req, res) => {
 });
 
 module.exports = router;
+

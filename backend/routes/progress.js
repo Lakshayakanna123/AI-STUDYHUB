@@ -47,6 +47,32 @@ router.post('/video', protect, async (req, res) => {
 
     await progress.save();
 
+    // Recalculate rolled up StudentProgress
+    if (courseId) {
+      const allVp = await VideoProgress.find({ student: req.user._id, course: courseId });
+      const completedCount = allVp.filter((vp) => vp.isCompleted).length;
+      const totalVids = await Video.countDocuments({ course: courseId });
+      const avgWatch = totalVids > 0
+        ? Math.round(allVp.reduce((s, v) => s + (v.completionPercent || 0), 0) / totalVids)
+        : (allVp.length ? Math.round(allVp.reduce((s, v) => s + v.completionPercent, 0) / allVp.length) : 0);
+
+      const existingSp = await StudentProgress.findOne({ student: req.user._id, course: courseId });
+      const quizAvg = existingSp?.avgQuizScore || 0;
+      const overall = Math.round(existingSp?.avgQuizScore ? (avgWatch * 0.4 + quizAvg * 0.6) : avgWatch);
+
+      await StudentProgress.findOneAndUpdate(
+        { student: req.user._id, course: courseId },
+        {
+          videosCompleted: completedCount,
+          totalVideos: totalVids,
+          overallProgressPercent: overall,
+          learningScore: overall >= 85 ? 'Excellent' : overall >= 70 ? 'Good' : overall >= 50 ? 'Average' : 'Needs Improvement',
+          performancePrediction: quizAvg >= 80 && avgWatch >= 70 ? 'High Performer' : (quizAvg < 50 || avgWatch < 30 ? 'At risk' : 'On track'),
+        },
+        { upsert: true, new: true }
+      );
+    }
+
     await Analytics.create({
       student: req.user._id,
       course: courseId,
