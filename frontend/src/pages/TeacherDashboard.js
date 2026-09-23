@@ -41,6 +41,7 @@ const TeacherDashboard = () => {
   const [selectedStatus, setSelectedStatus] = useState('all');
   const [selectedStudent, setSelectedStudent] = useState(null);
   const [newCourse, setNewCourse] = useState({ title: '', description: '' });
+  const [creating, setCreating] = useState(false);
   const [error, setError] = useState('');
 
   const load = async () => {
