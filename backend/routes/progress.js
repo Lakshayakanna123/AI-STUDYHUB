@@ -17,6 +17,8 @@ router.post('/video', protect, async (req, res) => {
     const video = await Video.findById(videoId);
     if (!video) return res.status(404).json({ message: 'Video not found' });
 
+    const effectiveCourseId = courseId || video.course;
+
     if (durationSeconds > 0 && (!video.durationSeconds || video.durationSeconds === 0)) {
       video.durationSeconds = Math.round(durationSeconds);
       await video.save();
@@ -24,7 +26,9 @@ router.post('/video', protect, async (req, res) => {
 
     let progress = await VideoProgress.findOne({ student: req.user._id, video: videoId });
     if (!progress) {
-      progress = new VideoProgress({ student: req.user._id, video: videoId, course: courseId });
+      progress = new VideoProgress({ student: req.user._id, video: videoId, course: effectiveCourseId });
+    } else if (!progress.course) {
+      progress.course = effectiveCourseId;
     }
 
     progress.lastPositionSeconds = positionSeconds ?? progress.lastPositionSeconds;
