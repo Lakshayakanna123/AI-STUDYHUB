@@ -6,10 +6,17 @@ const StudentDashboard = () => {
   const [data, setData] = useState(null);
   const [joinCode, setJoinCode] = useState('');
   const [message, setMessage] = useState('');
+  const [error, setError] = useState('');
 
   const load = async () => {
-    const { data } = await api.get('/analytics/student');
-    setData(data);
+    try {
+      setError('');
+      const { data } = await api.get('/analytics/student');
+      setData(data);
+    } catch (err) {
+      console.error('Failed to load student analytics:', err);
+      setError(err.response?.data?.message || 'Session expired or failed to load dashboard.');
+    }
   };
 
   useEffect(() => {
@@ -28,6 +35,19 @@ const StudentDashboard = () => {
       setMessage(err.response?.data?.message || 'Failed to join');
     }
   };
+
+  if (error) {
+    return (
+      <div className="flex items-center justify-center min-h-[60vh] p-6">
+        <div className="bg-rose-50 border border-rose-200 rounded-xl p-6 text-center max-w-md shadow-sm space-y-3">
+          <p className="text-rose-700 font-semibold">{error}</p>
+          <a href="/login" className="inline-block bg-brand-500 hover:bg-brand-600 text-white font-medium text-sm px-4 py-2 rounded-lg">
+            Log In Again
+          </a>
+        </div>
+      </div>
+    );
+  }
 
   if (!data) return <div className="p-8 text-gray-500">Loading dashboard...</div>;
 

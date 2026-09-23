@@ -41,14 +41,16 @@ const TeacherDashboard = () => {
   const [selectedStatus, setSelectedStatus] = useState('all');
   const [selectedStudent, setSelectedStudent] = useState(null);
   const [newCourse, setNewCourse] = useState({ title: '', description: '' });
-  const [creating, setCreating] = useState(false);
+  const [error, setError] = useState('');
 
   const load = async () => {
     try {
+      setError('');
       const res = await api.get('/analytics/teacher');
       setData(res.data);
     } catch (err) {
       console.error('Failed to load teacher analytics:', err);
+      setError(err.response?.data?.message || 'Session expired or failed to load teacher analytics.');
     }
   };
 
@@ -68,6 +70,19 @@ const TeacherDashboard = () => {
       setCreating(false);
     }
   };
+
+  if (error) {
+    return (
+      <div className="flex items-center justify-center min-h-[60vh] p-6">
+        <div className="bg-rose-50 border border-rose-200 rounded-xl p-6 text-center max-w-md shadow-sm space-y-3">
+          <p className="text-rose-700 font-semibold">{error}</p>
+          <a href="/login" className="inline-block bg-brand-500 hover:bg-brand-600 text-white font-medium text-sm px-4 py-2 rounded-lg">
+            Log In Again
+          </a>
+        </div>
+      </div>
+    );
+  }
 
   if (!data) {
     return (
